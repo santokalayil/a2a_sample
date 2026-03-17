@@ -4,6 +4,12 @@ A minimalist, SDK-native integration demonstrating how to connect a custom backe
 
 This project has been heavily refactored to remove all custom bridging models, Redis reliance, and boilerplate orchestrators in favor of pure A2A native `Message`, `Task`, and `Part` primitives.
 
+## Streamlit Interface
+
+> *Built-in support for live status traces and file/JSON attachments.*
+
+![Streamlit UI Screenshot](assets/ui_screenshot.png)
+
 ## Architecture
 
 Here is a high-level overview of the components and data flow:
