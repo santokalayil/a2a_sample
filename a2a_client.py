@@ -1,107 +1,74 @@
-# from a2a.client import (
-#     ClientConfig, ClientEvent,
-#     ClientCallContext, ClientCallInterceptor,
-#     ClientFactory,
-# )
-# from a2a.types import (
-#     Message,
-#     MessageSendConfiguration,
-#     MessageSendParams,
-#     #
-#     Task,
-#     TaskArtifactUpdateEvent,
-#     TaskQueryParams,
-#     TaskState,
-#     TaskStatus,
-#     TaskPushNotificationConfig,
-#     TaskStatusUpdateEvent,
-#     TaskResubscriptionRequest,
-#     TaskIdParams,
-#     GetTaskRequest,
-#     GetTaskResponse,
-#     GetTaskSuccessResponse,
-#     GetTaskPushNotificationConfigRequest,
-#     GetTaskPushNotificationConfigResponse,
-#     GetTaskPushNotificationConfigParams,
-#     GetTaskPushNotificationConfigSuccessResponse
-# )
-
 import asyncio
+import uuid
 from contextlib import aclosing
-# from typing import Any, Awaitable
-
-# from adapters.redis_taskstore import RedisTaskStoreAdapter
-
-
-# async def main() -> None:
-#     task_store = RedisTaskStoreAdapter()
-#     key = "name"
-
-#     await task_store.set(key, "Sanljljljlj")
-#     value = await task_store.get(key)
-#     print(f"{key=} | {value=}")
-#     return
+from pathlib import Path
 
 import httpx
-from a2a.client import A2ACardResolver, Client, ClientFactory, ClientConfig, ClientEvent
+from a2a.client import A2ACardResolver, Client, ClientFactory, ClientConfig
 from a2a.client.client import UpdateEvent
-from a2a.types import AgentCard, Message, Part, TextPart, DataPart, Role, Task, TaskStatusUpdateEvent, TaskArtifactUpdateEvent
-from a2a.types import TaskStatus, TaskState
-from a2a.utils import get_data_parts, get_artifact_text
-from a2a_server import models
-from typing import AsyncIterator, AsyncGenerator
-from dataclasses import dataclass
-import uuid
+from a2a.types import (
+    AgentCard, Message, Part, TextPart, DataPart, Role,
+    Task, TaskStatusUpdateEvent, TaskArtifactUpdateEvent,
+    TaskStatus, TaskState, FilePart, FileWithBytes
+)
+from a2a.utils import get_data_parts, get_message_text, get_text_parts
 
 HOST: str = "localhost"
-PORT: int = 8001  # Servers' PORT and host
+PORT: int = 8001
 BASE_URL: str = f"http://{HOST}:{PORT}"
-
 AUTH_TOKEN = "Bearer ABCD"
-
-
-
-@dataclass
-class InputRequiredResult:
-    task_id: str
-    agent_response: models.AgentResponse
-
-@dataclass
-class CompletedResult:
-    agent_response: models.AgentResponse
-
-@dataclass
-class ErrorResult:
-    state: str  # failed, rejected, etc.
-    message: str
-
-type Result = InputRequiredResult | CompletedResult | ErrorResult
-
-def create_a2a_request_message(
-        agent_request: models.AgentRequest,
-        task_id: str | None = None,
-    ) -> Message:
-    parts = [Part(root=DataPart(data=agent_request.model_dump()))]
-    msg = Message(
-        message_id=uuid.uuid4().hex,  # NOTE: think of this later uuid.uuid4()
-        context_id=agent_request.session_id,
-        parts=parts,
-        role=Role.user,
-        # task_id=agent_request.task_id,
-        task_id=task_id,  # NOTE: change it to add to task_id
-    )
-    return msg
-
-def extract_a2a_response(message: Message) -> models.AgentResponse:
-    data_parts = get_data_parts(message.parts)
-    assert len(data_parts) == 1
-    data = data_parts[0]
-    return models.AgentResponse.model_validate(data)
-
-from pathlib import Path
 
 TEMP_DIR = Path(__file__).parent / ".temp"
 
+
+# ── Message builders ───────────────────────────────────────────────────────────
+
+def make_user_message(
+    text: str,
+    context_id: str,
+    task_id: str | None = None,
+    data: dict | None = None,
+    files: list[dict[str, str | bytes]] | None = None,
+) -> Message:
+    """Creates a native A2A user Message handling Text, Data, and Files.
+
+    - text  → always sent as TextPart (the user's readable message)
+    - data  → optional dict, sent as DataPart
+    - files → optional list of dicts: {"name": "foo.pdf", "bytes": base64_str, "mime_type": "..."}
+              sent as FilePart with FileWithBytes.
+    """
+    parts: list[Part] = [Part(root=TextPart(text=text))]
+    
+    if data:
+        parts.append(Part(root=DataPart(data=data)))
+        
+    if files:
+        for f in files:
+            parts.append(Part(root=FilePart(
+                file=FileWithBytes(
+                    bytes=f["bytes"], 
+                    name=f["name"], 
+                    mime_type=f.get("mime_type")
+                )
+            )))
+
+    return Message(
+        message_id=uuid.uuid4().hex,
+        role=Role.user,
+        context_id=context_id,
+        task_id=task_id,
+        parts=parts,
+    )
+
+
+def extract_text_from_message(message: Message) -> str:
+    """Reads all TextParts from an A2A Message joined as one string.
+    This is a thin wrapper over the SDK's get_message_text().
+    """
+    return get_message_text(message)
+
+
+# ── Streaming client ───────────────────────────────────────────────────────────
 
 async def streaming_main() -> None:
     async with httpx.AsyncClient(
@@ -110,132 +77,116 @@ async def streaming_main() -> None:
         resolver = A2ACardResolver(base_url=BASE_URL, httpx_client=httpx_client)
         agent_card: AgentCard | None = await resolver.get_agent_card()
         assert agent_card is not None, "Could not resolve agent card"
+
         client: Client = ClientFactory(
             ClientConfig(streaming=True, httpx_client=httpx_client)
         ).create(agent_card)
 
-        user_id = "ABC"
+        # session_id = orchestrator-managed session (replaces user_id)
         session_id: str = "DEF"
-        # client, agent_req, task_id
-        agent_request = models.AgentRequest(
-            user_id=user_id,
-            session_id=session_id,
-            request="Hi How you are you doing?",
-        )
-        msg = create_a2a_request_message(agent_request) # task_id also can be added
-        # stream: AsyncGenerator[ClientEvent | Message, None] = client.send_message(msg)
-        # gen: AsyncIterator[ClientEvent | Message] = aiter(stream)
-        
+        msg = make_user_message("Hi! How are you doing?", context_id=session_id)
+
         completed = False
         idx = 0
         while not completed:
             async with aclosing(client.send_message(msg)) as stream:
-                async for item in stream:  # Client Event arikkum always
+                async for item in stream:
                     idx += 1
-                    if isinstance(item, tuple):
-                        task: Task = item[0]
-                        (TEMP_DIR / f"{idx}_task.json").write_text(task.model_dump_json(indent=4), encoding="utf-8")
-
-                        update_event: TaskStatusUpdateEvent | TaskArtifactUpdateEvent| None = item[1]  # UpdateEvent
-                        assert update_event is not None, "Update Event is None, which is not so far seen"
-                        if isinstance(update_event, TaskStatusUpdateEvent):
-                            (TEMP_DIR / f"{idx}_task_update_event.json").write_text(update_event.model_dump_json(indent=4), encoding="utf-8")
-                        else:  # isinstance(update_event, TaskArtifactUpdateEvent)
-                            (TEMP_DIR / f"{idx}_t_artifact_update_event.json").write_text(update_event.model_dump_json(indent=4), encoding="utf-8")
-                    
-                        task_status: TaskStatus = task.status
-                        match task_status.state:
-                            case TaskState.submitted | TaskState.working:
-                                print(f"[{session_id}] Task ({task.id}) is in {task_status.state} state")
-                                if task_status.message:
-                                    assert task_status.message.context_id, "Session Id not found!"
-                                    session_id = task_status.message.context_id
-
-                                    # NOTE: for now breaking. since we always wanted to create task
-                                    assert task_status.message.task_id, "Task Id not found!"
-                                    assert task_status.message.task_id == task.id, "Message TaskId and actual task id does not match!"
-                                    assert task_status.message.parts
-                                    for part in task_status.message.parts:
-                                        if isinstance(part.root, DataPart):
-                                            agent_response_data = part.root.data
-                                            print("AGENT RESPONSE DATA PART >>>>>>", agent_response_data)
-                                        elif isinstance(part.root, TextPart):
-                                            agent_response_text = part.root.text
-                                            print("AGENT RESPONSE TEXT PART >>>>>>", agent_response_text)
-                                        else:
-                                            raise NotImplementedError("Part is not a data part")
-                                else:
-                                    print("Task message not found")
-                                    print("UPDATE EVENT =======>>", update_event.model_dump_json(indent=4))
-                                    print("TASK_STATUS =======>>", task.status.model_dump_json(indent=4))
-                                    # raise ValueError("Task Message is always expected")
-                                    # completed = True
-
-                            case TaskState.input_required:
-                                print(f"[{session_id}] Task ({task.id}) is in {task_status.state} state")
-                                if task_status.message:
-                                    assert task_status.message.context_id, "Session Id not found!"
-                                    session_id = task_status.message.context_id
-
-                                    # NOTE: for now breaking. since we always wanted to create task
-                                    assert task_status.message.task_id, "Task Id not found!"
-                                    assert task_status.message.task_id == task.id, "Message TaskId and actual task id does not match!"
-                                    agent_response: models.AgentResponse = extract_a2a_response(task_status.message)
-                                    print(f"[{task.context_id}] Task [{task.id}] USER INPUT REQUIRED >>>>>>", agent_response)
-                                    user_response = input(agent_response.response)
-                                    # construct agent response with user_response
-                                    agent_request = models.AgentRequest(
-                                        user_id=user_id,
-                                        session_id=session_id,
-                                        request=user_response,
-                                    )
-                                    user_reply_msg = create_a2a_request_message(agent_request, task.id)
-                                    msg = user_reply_msg  # for while loop
-                                    # still task not completed, so break here and restart next iteration of while loop
-                                    break
-                                else:
-                                    print("Error: task message is always expected")
-                                    print(task.model_dump_json(indent=4))
-                                    raise ValueError("Task Message is always expected")
-                            case TaskState.completed:
-                                print(f"[{session_id}] Task [{task.id}] completed >>>>>>>>")
-                                completed = True  # to STOP while loop iteration
-                                assert task_status.message, "task status must have message"
-                                # print(task_status.message.model_dump_json(indent=4))
-                                if task.artifacts:
-                                    for artifact in task.artifacts:
-                                        print(f"[{session_id}] Task [{task.id}] Artifact found with id {artifact.artifact_id}")
-                                        if artifact.name:
-                                            print(f"[{session_id}] Task [{task.id}] Artifact name {artifact.name}")
-                                        if artifact.description:
-                                            print(f"[{session_id}] Task [{task.id}] Artifact description {artifact.description}")
-                                        if artifact.parts:
-                                            print(f"[{session_id}] Task [{task.id}] >>> Artifact Parts")
-                                            print(get_data_parts(artifact.parts))
-                                            print(100 * "-")
-                                else:
-                                    print(f"[{session_id}] Task [{task.id}] Artifacts not found")
-                                break
-                            case TaskState.rejected:
-                                print(f"[{session_id}] Task [{task.id}] is rejected due ....")
-                                completed = True
-                                break
-                            case _:
-                                print(f"[{session_id}] Task [{task.id}] has unexpected status: {task_status.state}")
-                                raise NotImplementedError
-
-
-
-                        # task_status.message
-                    else:
-                        print(type(item))
+                    if not isinstance(item, tuple):
+                        print(f"Unexpected item type: {type(item)}")
                         raise NotImplementedError
-    return
+
+                    task: Task = item[0]
+                    update_event: TaskStatusUpdateEvent | TaskArtifactUpdateEvent | None = item[1]
+                    assert update_event is not None
+
+                    # Save debug snapshots
+                    (TEMP_DIR / f"{idx}_task.json").write_text(
+                        task.model_dump_json(indent=4), encoding="utf-8"
+                    )
+                    if isinstance(update_event, TaskStatusUpdateEvent):
+                        (TEMP_DIR / f"{idx}_task_update_event.json").write_text(
+                            update_event.model_dump_json(indent=4), encoding="utf-8"
+                        )
+                    else:
+                        (TEMP_DIR / f"{idx}_t_artifact_update_event.json").write_text(
+                            update_event.model_dump_json(indent=4), encoding="utf-8"
+                        )
+
+                    task_status: TaskStatus = task.status
+
+                    match task_status.state:
+
+                        case TaskState.submitted | TaskState.working:
+                            print(f"[{session_id}] Task ({task.id}) → {task_status.state}")
+                            if task_status.message:
+                                session_id = task_status.message.context_id or session_id
+                                # Read text directly — no custom model unwrapping
+                                agent_text = extract_text_from_message(task_status.message)
+                                if agent_text:
+                                    print(f"[{session_id}]   Agent says: {agent_text!r}")
+                            else:
+                                # working with no message = just a state heartbeat, keep waiting
+                                print(f"[{session_id}] Task ({task.id}) working (no message)")
+
+                        case TaskState.input_required:
+                            print(f"[{session_id}] Task ({task.id}) → INPUT REQUIRED")
+                            if not task_status.message:
+                                print(task.model_dump_json(indent=4))
+                                raise ValueError("input_required state must carry a message to show the user")
+
+                            session_id = task_status.message.context_id or session_id
+
+                            # Read the agent's prompt directly from TextPart
+                            prompt = extract_text_from_message(task_status.message)
+                            if not prompt:
+                                raise ValueError("input_required message has no text content")
+
+                            print(f"[{session_id}] Task [{task.id}] Agent asks: {prompt!r}")
+                            user_reply = input(f"  → {prompt} ")
+
+                            # Send reply: same context_id + same task_id (continuation)
+                            msg = make_user_message(user_reply, context_id=session_id, task_id=task.id)
+                            break  # exit async for → while loop sends new msg
+
+                        case TaskState.completed:
+                            print(f"[{session_id}] Task [{task.id}] COMPLETED >>>>>>>>")
+                            completed = True  # stop while loop
+
+                            if task_status.message:
+                                text = extract_text_from_message(task_status.message)
+                                if text:
+                                    print(f"[{session_id}]   Agent: {text!r}")
+
+                            if task.artifacts:
+                                for artifact in task.artifacts:
+                                    print(f"[{session_id}] Artifact [{artifact.artifact_id}] name={artifact.name!r}")
+                                    if artifact.parts:
+                                        data_parts = get_data_parts(artifact.parts)
+                                        for d in data_parts:
+                                            print(f"   data: {d}")
+                                        text_parts = get_text_parts(artifact.parts)
+                                        for t in text_parts:
+                                            print(f"   text: {t!r}")
+                                    print("-" * 80)
+                            else:
+                                print(f"[{session_id}] No artifacts in completed task")
+                            break
+
+                        case TaskState.rejected:
+                            print(f"[{session_id}] Task [{task.id}] REJECTED")
+                            if task_status.message:
+                                text = extract_text_from_message(task_status.message)
+                                print(f"   Reason: {text!r}")
+                            completed = True
+                            break
+
+                        case _:
+                            print(f"[{session_id}] Task [{task.id}] unexpected state: {task_status.state}")
+                            raise NotImplementedError(f"Unhandled state: {task_status.state}")
 
 
-def construct_status_message(message: Message) -> models.AgentResponse:
-    ...
-
+# ── Non-streaming client (for reference) ──────────────────────────────────────
 
 async def non_streaming_main() -> None:
     async with httpx.AsyncClient(
@@ -244,41 +195,27 @@ async def non_streaming_main() -> None:
         resolver = A2ACardResolver(base_url=BASE_URL, httpx_client=httpx_client)
         agent_card: AgentCard | None = await resolver.get_agent_card()
         assert agent_card is not None, "Could not resolve agent card"
+
         client: Client = ClientFactory(
             ClientConfig(streaming=False, httpx_client=httpx_client)
         ).create(agent_card)
 
-        user_id = "SANTO_USER"
         session_id: str = "SANTO_SESSION"
-        # client, agent_req, task_id
-        agent_request = models.AgentRequest(
-            user_id=user_id,
-            session_id=session_id,
-            request="Hi How you are you doing?",
-        )
-        msg = create_a2a_request_message(agent_request)
+        msg = make_user_message("Hi! How are you doing?", context_id=session_id)
 
-        # send_message is ALWAYS an async generator (even in non-streaming mode).
-        # Non-streaming: it makes one HTTP call, yields the final Task once, then stops.
-        # Streaming: it yields (Task, UpdateEvent) tuples as SSE events arrive.
-        # So you can NEVER await it — always use async for or anext().
-        print(f"[{session_id}] Sending message...")
-        reply = await anext(client.send_message(msg))   # grab the one-and-only item
+        # send_message is ALWAYS an async generator, even in non-streaming mode.
+        # Non-streaming: one HTTP call → yields one (Task, None) tuple → stops.
+        reply = await anext(client.send_message(msg))
 
-        print(type(reply))
-
-        # In non-streaming mode, reply is a (Task, None) tuple or just a Task
-        assert isinstance(reply, tuple), "Reply is not a tuple"
+        assert isinstance(reply, tuple), "Expected (Task, None) tuple in non-streaming mode"
         task, _ = reply
         print(f"[{task.context_id}] Task [{task.id}] state: {task.status.state}")
+
         if task.artifacts:
             for artifact in task.artifacts:
-                print(f"[{task.context_id}] task_id [{task.id}] artifact_id [{artifact.artifact_id}]")
+                print(f"  Artifact [{artifact.artifact_id}] name={artifact.name!r}")
                 print(artifact.model_dump_json(indent=4))
-        # print(task.model_dump_json(indent=4))
 
 
 if __name__ == "__main__":
     asyncio.run(streaming_main())
-    
-
