@@ -6,6 +6,30 @@ This project has been heavily refactored to remove all custom bridging models, R
 
 ## Architecture
 
+Here is a high-level overview of the components and data flow:
+
+```mermaid
+sequenceDiagram
+    participant UI as Streamlit UI
+    participant Client as A2A ClientFactory
+    participant API as FastAPI Server
+    participant Agent as AgentExecutor
+
+    UI->>Client: Chat Text, JSON, Files
+    Client->>Client: Pack into A2A Message (TextPart, DataPart, FilePart)
+    
+    rect rgb(20, 50, 80)
+    Note right of Client: HTTP POST / Server-Sent Events (SSE)
+    Client->>API: send_message()
+    API->>Agent: execute()
+    end
+    
+    Agent-->>API: yield TaskStates (working, input_required, completed)
+    Agent-->>API: yield Artifacts (DataPart containing task_id, etc)
+    API-->>Client: Stream SSE Events
+    Client-->>UI: Stored in st.session_state & rendered via st.status
+```
+
 The project contains two main architectural components:
 
 ### 1. The Agent Server (`a2a_server/`)
