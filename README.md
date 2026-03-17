@@ -52,6 +52,15 @@ The "face", pretending to be a generic orchestrator.
   - Support for `input_required` conversational multi-turn prompts
   - File/Data generic upload handling
 
+## Supported Execution Modes
+
+Because Streamlit is a frontend UI script, the SDK interacts with the A2A Server using the following two native connection methods:
+
+1. **Streaming (SSE):** The recommended user-experience method. Streamlit opens a single HTTP connection and holds it open, listening to `yield` events (working, completed, artifacts) as they happen in real-time.
+2. **Blocking / Polling (Non-Streaming):** Streamlit makes a standard synchronous HTTP request and awaits the final Task completion object. In larger asynchronous setups, this is typically wrapped in a `while True: time.sleep(2)` loop to poll the `GET /tasks/{task_id}` endpoint.
+
+> **Note on Push Notifications (Webhooks):** The A2A SDK natively supports `PushNotificationConfig` to automatically fire webhook HTTP `POST` requests to an external server when long-running background tasks reach new states. Because a frontend like Streamlit cannot spin up an inbound web server listener to catch these webhooks, implementing true "Fire-and-Forget" push notification architecture requires standing up a lightweight orchestrator API specifically to act as the middleman to collect those results and store them in a database.
+
 ## Running the Application
 
 This project uses `uv` for fast dependency management and execution.
@@ -70,6 +79,6 @@ Open your browser to the URL provided by Streamlit (usually `http://localhost:85
 
 ## Using the UI
 
-1. **Streaming vs Non-Streaming:** Use the toggle in the sidebar to switch between receiving SSE real-time state updates vs one blocking HTTP call.
+1. **Streaming vs Non-Streaming:** Use the toggle in the sidebar to switch between receiving SSE real-time state updates (Live Traces) vs one blocking HTTP call (No Traces).
 2. **Multi-turn Tasks:** Send a message like "Hi". The agent will respond asking "Please select an option: A, B, or C". You can reply to continue the specific `task_id`.
 3. **Attachments:** Before sending a message, use the built-in expanders to upload a file or define a JSON dict. These are packed natively into `FilePart` and `DataPart` arrays and read transparently by the executing agent.
