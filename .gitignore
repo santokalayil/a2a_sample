@@ -12,3 +12,6 @@ dump.rdb
 .temp
 
 uv.lock
+a2a.log
+orch.log
+streamlit.log
