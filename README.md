@@ -1,84 +1,104 @@
-# A2A Agent Setup
+# Event-Driven A2A Orchestrator
 
-A minimalist, SDK-native integration demonstrating how to connect a custom backend agent with a generic client UI using the `a2a-sdk`.
+A robust, 3-tier integration demonstrating an asynchronous, event-driven orchestration pattern for A2A Agents using **Redis Pub/Sub** and **FastAPI**.
 
-This project has been heavily refactored to remove all custom bridging models, Redis reliance, and boilerplate orchestrators in favor of pure A2A native `Message`, `Task`, and `Part` primitives.
+This project decouples the frontend UI from the backend agent execution by introducing an Orchestrator API that handles state management and real-time event relay.
 
-## Streamlit Interface
+## Architecture: Hybrid Event-Driven
 
-> *Built-in support for live status traces and file/JSON attachments.*
-
-![Streamlit UI Screenshot](assets/ui_screenshot.png)
-
-## Architecture
-
-Here is a high-level overview of the components and data flow:
+The system uses a **redundant hybrid pattern** for maximum reliability:
+1.  **SSE Relay (Live Traces)**: Sub-millisecond updates during active sessions.
+2.  **Push Notifications (Webhooks)**: Persistent, stateless callbacks from the Agent for long-running background tasks.
 
 ```mermaid
-sequenceDiagram
-    participant UI as Streamlit UI
-    participant Client as A2A ClientFactory
-    participant API as FastAPI Server
-    participant Agent as AgentExecutor
-
-    UI->>Client: Chat Text, JSON, Files
-    Client->>Client: Pack into A2A Message (TextPart, DataPart, FilePart)
-    
-    rect rgb(20, 50, 80)
-    Note right of Client: HTTP POST / Server-Sent Events (SSE)
-    Client->>API: send_message()
-    API->>Agent: execute()
+graph TB
+    subgraph Client ["Frontend (Streamlit)"]
+        UI["Web UI :8501"]
     end
-    
-    Agent-->>API: yield TaskStates (working, input_required, completed)
-    Agent-->>API: yield Artifacts (DataPart containing task_id, etc)
-    API-->>Client: Stream SSE Events
-    Client-->>UI: Stored in st.session_state & rendered via st.status
+
+    subgraph Orchestrator ["Orchestrator Layer (FastAPI) :8002"]
+        API["REST API<br/>/chat, /stream, /webhook"]
+        Pump["Stream Pump<br/>(Background asyncio)"]
+        Adapters["Adapters<br/>(Ports & Adapters)"]
+    end
+
+    subgraph Infra ["Infrastructure"]
+        RedisPubSub["Redis Pub/Sub<br/>(Event Bus)"]
+        RedisState["Redis KV<br/>(Session State)"]
+    end
+
+    subgraph AgentLayer ["Agent Layer :8001"]
+        Agent["A2A Agent Server"]
+        TaskStore["Redis Task Store"]
+    end
+
+    %% Flow: Initial Request
+    UI -- "1. POST /chat" --> API
+    API -- "2. Check State" --> RedisState
+    API -- "3. Dispatch Task" --> Agent
+
+    %% Flow: Path A (Real-time SSE Relay)
+    Agent -. "4a. SSE Stream (Traces)" .-> Pump
+    Pump -- "5a. Publish Event" --> RedisPubSub
+
+    %% Flow: Path B (Background Webhook Callback)
+    Agent -- "4b. POST /webhook (State Change)" --> API
+    API -- "5b. Publish Event" --> RedisPubSub
+
+    %% Flow: UI Update
+    UI -- "6. GET /stream (SSE)" --> API
+    API -- "7. Subscribe" --> RedisPubSub
+    RedisPubSub -- "8. Relay Events" --> API
+    API -- "9. Update UI" --> UI
+
+    %% Styling
+    style RedisPubSub fill:#f96,stroke:#333,stroke-width:2px
+    style RedisState fill:#f96,stroke:#333,stroke-width:2px
+    style Agent fill:#6b4,stroke:#333,stroke-width:2px
+    style UI fill:#4af,stroke:#333,stroke-width:2px
 ```
 
-The project contains two main architectural components:
+1.  **A2A Agent Server (Port 8001)**: Native agent execution. Now configured with `HttpPushNotificationSender` to ping the Orchestrator on every state change.
+2.  **Orchestrator API (Port 8002)**: The stateless hub. Receives both live streams and background webhooks, unifying them in Redis.
+3.  **Streamlit UI (Port 8501)**: Consumes the unified event stream from Redis.
 
-### 1. The Agent Server (`a2a_server/`)
-The "brain". It runs an A2A standard FastAPI server, exposing the underlying execution logic via an `AgentExecutor`.
-- **`executor.py`:** Contains the `AgentExecutor.execute()` logic handling state transitions (`NEW`, `input_required`, `completed`), processing incoming `TextPart`, `DataPart`, and `FilePart` data, and generating `DataPart` structured artifacts.
-- **`__main__.py`:** Boots up the native A2A `DefaultRequestHandler` and `FastAPIAppBuilder` to serve the API on `localhost:8001`.
+## Key Features
 
-### 2. The Client
-The "face", pretending to be a generic orchestrator.
-- **`a2a_client.py`:** A low-level Python script utilizing the A2A `ClientFactory` to communicate with the server. It handles packing user chat texts, JSON blobs, and base64-encoded file bytes straight into standard A2A `Message` objects.
-- **`streamlit_client.py`:** A full-featured Streamlit chat UI that leverages `a2a_client.py`. It supports:
-  - Persistent chat history and trace logs
-  - Live Server-Sent Events (SSE) streaming updates via an interactive `st.status` expander
-  - Support for `input_required` conversational multi-turn prompts
-  - File/Data generic upload handling
+- **Decoupled Orchestration**: The UI never talks directly to the Agent Server.
+- **Event Relay Pattern**: Orchestrator "pumps" SDK events into Redis Pub/Sub, allowing multiple subscribers and resilient stream handling.
+- **Task Persistence**: Supports `input-required` multi-turn prompts by persisting `task_id` and routing follow-up replies to existing background tasks.
+- **Pluggable Adapters**: Built with `StateStore` and `MessageBus` ports, currently using `RedisAdapter`.
 
-## Supported Execution Modes
+## Infrastructure
 
-Because Streamlit is a frontend UI script, the SDK interacts with the A2A Server using the following two native connection methods:
+This project requires **Redis** for state and messaging. Run it using Docker:
 
-1. **Streaming (SSE):** The recommended user-experience method. Streamlit opens a single HTTP connection and holds it open, listening to `yield` events (working, completed, artifacts) as they happen in real-time.
-2. **Blocking / Polling (Non-Streaming):** Streamlit makes a standard synchronous HTTP request and awaits the final Task completion object. In larger asynchronous setups, this is typically wrapped in a `while True: time.sleep(2)` loop to poll the `GET /tasks/{task_id}` endpoint.
+```bash
+docker run -d --name a2a-redis -p 6379:6379 redis:alpine
+```
 
-> **Note on Push Notifications (Webhooks):** The A2A SDK natively supports `PushNotificationConfig` to automatically fire webhook HTTP `POST` requests to an external server when long-running background tasks reach new states. Because a frontend like Streamlit cannot spin up an inbound web server listener to catch these webhooks, implementing true "Fire-and-Forget" push notification architecture requires standing up a lightweight orchestrator API specifically to act as the middleman to collect those results and store them in a database.
+## Setup & Running
 
-## Running the Application
+This project uses `uv` for dependency management.
 
-This project uses `uv` for fast dependency management and execution.
-
-### Terminal 1: Start the Agent API
+### 1. Start the Agent Server
 ```bash
 uv run python -m a2a_server
 ```
-Runs the A2A backend on `http://localhost:8001`.
 
-### Terminal 2: Start the Streamlit UI
+### 2. Start the Orchestrator API
+```bash
+uv run uvicorn orchestrator_api.main:app --port 8002
+```
+
+### 3. Start the Streamlit UI
 ```bash
 uv run streamlit run streamlit_client.py
 ```
-Open your browser to the URL provided by Streamlit (usually `http://localhost:8501`).
 
 ## Using the UI
 
-1. **Streaming vs Non-Streaming:** Use the toggle in the sidebar to switch between receiving SSE real-time state updates (Live Traces) vs one blocking HTTP call (No Traces).
-2. **Multi-turn Tasks:** Send a message like "Hi". The agent will respond asking "Please select an option: A, B, or C". You can reply to continue the specific `task_id`.
-3. **Attachments:** Before sending a message, use the built-in expanders to upload a file or define a JSON dict. These are packed natively into `FilePart` and `DataPart` arrays and read transparently by the executing agent.
+1. **New Session**: Generates a fresh UUID in the sidebar.
+2. **Streaming Mode**: Real-time `st.status` traces powered by Redis SSE.
+3. **Artifacts**: Automatic extraction and rendering of structured data produced by the agent.
+4. **Context Recovery**: Responding to an "Input Required" prompt preserves the background task context.

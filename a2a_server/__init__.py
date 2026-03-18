@@ -4,8 +4,11 @@ from .config import HOST, PORT
 from a2a.types import AgentCard, AgentCapabilities, AgentSkill
 from a2a.server.request_handlers import DefaultRequestHandler
 from a2a.server.apps import A2AFastAPIApplication
-from a2a_redis import RedisTaskStore #, RedisStreamsEventQueue, RedisPushNotificationConfigStore
+from a2a_redis import RedisTaskStore, RedisPushNotificationConfigStore
 from a2a_redis.utils import create_redis_client
+import httpx
+from a2a.server.tasks.push_notification_sender import PushNotificationSender
+from a2a.types import Task, PushNotificationConfig
 
 REDIS_HOST = "localhost"
 REDIS_PORT = 6379
@@ -18,6 +21,28 @@ TASK_STORE = RedisTaskStore(
     redis_client=create_redis_client(url=REDIS_URL, max_connections=REDIS_MAX_CONN),
     prefix=REDIS_PREFIX,
 )
+ 
+PUSH_CONFIG_STORE = RedisPushNotificationConfigStore(
+    redis_client=TASK_STORE.redis,
+    prefix="ca2as:push:"
+)
+ 
+class HttpPushNotificationSender(PushNotificationSender):
+    def __init__(self, config_store):
+        self._config_store = config_store
+
+    async def send_notification(self, task: Task) -> None:
+        try:
+            configs = await self._config_store.get_info(task.id)
+            if not configs:
+                return
+            
+            async with httpx.AsyncClient(timeout=10) as client:
+                for config in configs:
+                    await client.post(config.url, json=task.model_dump(mode="json"))
+                    print(f"[PushNotification] Sent update to {config.url}", flush=True)
+        except Exception as e:
+            print(f"[PushNotification] Failed to send update: {e}", flush=True)
 
 agent_url = f"http://{HOST}:{PORT}"
 agent_version = "0.1.0"
@@ -25,7 +50,7 @@ modes = ["text/plain"]
 input_modes = modes.copy()
 output_modes = modes.copy()
 
-caps = AgentCapabilities(streaming=True, push_notifications=False, extensions=None)
+caps = AgentCapabilities(streaming=True, push_notifications=True, extensions=None)
 skills = [
     AgentSkill(
         id="QnA_skill",
@@ -51,9 +76,8 @@ from .executor import AgentExecutor
 request_handler = DefaultRequestHandler(
     agent_executor=AgentExecutor(),
     task_store=TASK_STORE,
-    # queue_manager=
-    # push_config_store=
-    # push_sender=
+    push_config_store=PUSH_CONFIG_STORE,
+    push_sender=HttpPushNotificationSender(PUSH_CONFIG_STORE),
 )
 
 app = A2AFastAPIApplication(
